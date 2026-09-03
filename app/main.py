@@ -93,7 +93,7 @@ async def get_feed(response: Response, category: str = Query("All")) -> dict:
 
 
 @app.get("/api/article/{article_id}")
-async def get_article(article_id: str) -> dict:
+async def get_article(article_id: str, response: Response) -> dict:
     """Single-article lookup for permalink pages (e.g. the frontend's
     /post/:id route). Searches the same in-memory buffer as everything
     else — see `Broadcaster.get_by_id` for the one real limitation that
@@ -101,6 +101,12 @@ async def get_article(article_id: str) -> dict:
     item = await broadcaster.get_by_id(article_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Article not found")
+    # A published article's own content never changes after the fact —
+    # only "does this id still exist in the rolling buffer" can. Safe to
+    # let a shared cache (nginx, CDN, browser) hold onto it for longer
+    # than the feed snapshot: many readers opening the same trending link
+    # at once now costs one broadcaster lookup, not one per reader.
+    response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
     return item
 
 
@@ -116,18 +122,24 @@ async def search(q: str = Query(..., min_length=2)) -> dict:
 
 
 @app.get("/api/jobs")
-async def list_jobs() -> dict:
+async def list_jobs(response: Response) -> dict:
     """Real, currently-open listings from independent public job boards
     (see app/jobs.py) — no mock/sample postings."""
     items = await get_jobs()
+    # Job boards refresh far less often than the news feed — a longer
+    # shared-cache window here means a traffic spike on the Jobs tab is
+    # absorbed by nginx/browser cache instead of re-hitting the upstream
+    # boards (or even this process) on every request.
+    response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
     return {"items": items, "total": len(items)}
 
 
 @app.get("/api/jobs/{job_id}")
-async def get_job_detail(job_id: str) -> dict:
+async def get_job_detail(job_id: str, response: Response) -> dict:
     job = await get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
+    response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
     return job
 
 

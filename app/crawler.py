@@ -40,18 +40,29 @@ class _BroadcastPlugin(BasePlugin):
             logger.info("Dropped ad/sponsored item: %s", item.get("sourceUrl"))
             return
 
-        # RSS/Atom only ever gives us an excerpt and a single cover image.
-        # Fetch the live article page for the full body (and any extra
-        # in-article photos) before broadcasting — best-effort; falls back
-        # to the excerpt already on `item` if the fetch/extraction fails,
-        # so a slow or blocked publisher never drops the item.
+        # RSS/Atom only ever gives us an excerpt and, often, no usable
+        # cover image at all — many feeds simply don't set media:content,
+        # media:thumbnail, or <enclosure> (see _find_image in
+        # spiders/news_spider.py). Fetch the live article page for the
+        # full body, any extra in-article photos, and its og:image lead
+        # photo before broadcasting — best-effort; falls back to the
+        # excerpt already on `item` if the fetch/extraction fails, so a
+        # slow or blocked publisher never drops the item.
         async with self._content_semaphore:
-            content, images = await fetch_full_content_and_images(
+            content, images, og_image = await fetch_full_content_and_images(
                 item["sourceUrl"],
                 fallback=item.get("content") or item.get("excerpt", ""),
                 timeout=settings.download_timeout,
             )
         item["content"] = content
+        # If RSS didn't give us a cover image, og:image (present on
+        # virtually every publisher page, even ones this scraper can't
+        # otherwise fully render) is by far the most reliable fallback —
+        # this is what was previously missing, causing a real share of
+        # articles to reach the frontend with an empty `image` field even
+        # though the article genuinely has a photo.
+        if not item.get("image") and og_image:
+            item["image"] = og_image
         # Don't repeat the cover image as an "extra" image.
         item["images"] = [img for img in images if img != item.get("image")]
         item["topic"] = classify_topic(item.get("title", ""), item.get("excerpt", ""), item.get("tags"))

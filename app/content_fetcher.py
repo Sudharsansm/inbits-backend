@@ -73,10 +73,68 @@ def _drop_boilerplate(paragraphs: list[str]) -> list[str]:
     return [p for p in paragraphs if p and not _is_boilerplate(p)]
 
 
+def _resolve_url(src: str, base_url: str) -> str:
+    """Normalizes a scraped image URL to an absolute https(-preferring)
+    URL: protocol-relative (`//host/...`) and root-relative (`/path`)
+    URLs are resolved against the page they came from, same as a browser
+    would resolve them."""
+    src = src.strip()
+    if src.startswith("//"):
+        return "https:" + src
+    if src.startswith("/"):
+        from urllib.parse import urljoin
+
+        return urljoin(base_url, src)
+    return src
+
+
+def _first_srcset_url(srcset: str) -> str:
+    """`srcset="a.jpg 480w, b.jpg 960w"` -> "a.jpg". Several publisher
+    templates only lazy-load via `srcset`/`data-srcset` and leave `src`
+    empty or pointing at a 1x1 placeholder, so this is checked as a
+    fallback wherever `src`/`data-src` comes up empty."""
+    first = srcset.strip().split(",")[0].strip()
+    return first.split(" ")[0] if first else ""
+
+
+def _extract_og_image(tree, base_url: str) -> str:
+    """The single most reliable, universal source for an article's lead
+    photo: virtually every modern publisher sets `og:image` (or the
+    Twitter Card / `link rel="image_src"` equivalent) in `<head>` for
+    social-sharing previews, and — unlike the visible page body — these
+    tags are almost always present in the raw server-rendered HTML even
+    on JS-heavy sites this scraper can't otherwise render.
+
+    This exists because relying on RSS's own image fields (see
+    `_find_image` in spiders/news_spider.py) plus scanning the article
+    body for <img> tags (`_extract_images_from_tree` below) still misses
+    a lot of real articles: many RSS feeds carry no image data at all,
+    and a lot of publisher templates put the hero/featured image in a
+    <figure> or header block outside whichever container the body-text
+    selectors matched. og:image is checked first for exactly that gap —
+    see crawler.py, which uses this to fill `item["image"]` whenever the
+    RSS feed didn't already provide one.
+    """
+    for xpath in (
+        "//meta[@property='og:image']/@content",
+        "//meta[@property='og:image:secure_url']/@content",
+        "//meta[@name='twitter:image']/@content",
+        "//meta[@name='twitter:image:src']/@content",
+        "//link[@rel='image_src']/@href",
+    ):
+        for raw in tree.xpath(xpath):
+            src = _resolve_url(raw, base_url)
+            if src and not src.startswith("data:"):
+                return src
+    return ""
+
+
 def _extract_images_from_tree(tree, base_url: str, *, limit: int = 4) -> list[str]:
-    """Pulls extra in-article photos (not the RSS cover image) so posts
-    that genuinely carry a photo set can be shown like a multi-image
-    Instagram post instead of just their single lead image."""
+    """Pulls extra in-article photos (not the RSS cover image, and not
+    the og:image lead photo handled separately by `_extract_og_image`)
+    so posts that genuinely carry a photo set can be shown like a
+    multi-image Instagram post instead of just their single lead image.
+    """
     seen: list[str] = []
     for selector in _CANDIDATE_SELECTORS:
         try:
@@ -90,13 +148,14 @@ def _extract_images_from_tree(tree, base_url: str, *, limit: int = 4) -> list[st
             src = img.get("data-src") or img.get("src") or ""
             src = src.strip()
             if not src or src.startswith("data:"):
+                # Lazy-loaded images often leave src/data-src empty (or a
+                # blank placeholder) and only carry the real URL in a
+                # srcset variant -- check those before giving up on this
+                # <img> entirely.
+                src = _first_srcset_url(img.get("data-srcset") or img.get("srcset") or "")
+            if not src or src.startswith("data:"):
                 continue
-            if src.startswith("//"):
-                src = "https:" + src
-            elif src.startswith("/"):
-                from urllib.parse import urljoin
-
-                src = urljoin(base_url, src)
+            src = _resolve_url(src, base_url)
             if src not in seen:
                 seen.append(src)
             if len(seen) >= limit:
@@ -153,7 +212,9 @@ async def fetch_full_content(
     `fetch_full_content_and_images` for the version that also returns
     extra in-article images. This wrapper exists for callers (e.g.
     app/search.py) that only need the text."""
-    content, _images = await fetch_full_content_and_images(url, fallback=fallback, timeout=timeout, max_chars=max_chars)
+    content, _images, _og_image = await fetch_full_content_and_images(
+        url, fallback=fallback, timeout=timeout, max_chars=max_chars
+    )
     return content
 
 
@@ -163,14 +224,15 @@ async def fetch_full_content_and_images(
     fallback: str = "",
     timeout: float = 10.0,
     max_chars: int = 20_000,
-) -> tuple[str, list[str]]:
-    """Best-effort fetch of an article's full body text *and* any extra
-    in-article photos from its live page.
+) -> tuple[str, list[str], str]:
+    """Best-effort fetch of an article's full body text, any extra
+    in-article photos, and the page's og:image lead photo, all from its
+    live page.
 
     Never raises — on any network error, timeout, or empty extraction this
-    returns `(fallback, [])` (normally the RSS excerpt, no extra images)
-    instead, since a slow or blocked publisher should never break the
-    crawl or a single item.
+    returns `(fallback, [], "")` (normally the RSS excerpt, no extra
+    images, no lead image) instead, since a slow or blocked publisher
+    should never break the crawl or a single item.
     """
     try:
         client = get_http_client()
@@ -178,16 +240,17 @@ async def fetch_full_content_and_images(
         resp.raise_for_status()
     except (httpx.HTTPError, asyncio.TimeoutError) as exc:
         logger.debug("content fetch failed for %s: %s", url, exc)
-        return fallback, []
+        return fallback, [], ""
 
     try:
         tree = lxml_html.fromstring(resp.text)
         body = _extract_from_tree(tree)
         images = _extract_images_from_tree(tree, str(resp.url))
+        og_image = _extract_og_image(tree, str(resp.url))
     except Exception as exc:  # malformed HTML, parser edge cases, etc.
         logger.debug("content extraction failed for %s: %s", url, exc)
-        return fallback, []
+        return fallback, [], ""
 
     if not body:
-        return fallback, images
-    return body[:max_chars], images
+        return fallback, images, og_image
+    return body[:max_chars], images, og_image

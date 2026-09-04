@@ -137,9 +137,14 @@ async def search_live(query: str, *, limit: int = 15) -> list[dict[str, Any]]:
         )
         for item, result in zip(to_hydrate, results):
             if isinstance(result, tuple):
-                body, images = result
+                body, images, og_image = result
                 if body:
                     item["content"] = body
+                # Same og:image fallback as the regular crawl (see
+                # crawler.py) -- live search results should show a real
+                # photo just as reliably as the main feed does.
+                if not item.get("image") and og_image:
+                    item["image"] = og_image
                 item["images"] = [img for img in images if img != item.get("image")]
 
     return [i for i in items if not is_advertisement(i)]

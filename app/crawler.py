@@ -17,8 +17,13 @@ logger = logging.getLogger("crawler")
 
 # Full-article fetches happen on the live publisher site, on top of the RSS
 # poll — cap how many run at once so one crawl cycle doesn't hammer any
-# single site or the process's own connection pool.
-_CONTENT_FETCH_CONCURRENCY = 5
+# single site or the process's own connection pool. Now that already-seen
+# items are skipped before ever reaching this fetch (see `item_scraped`
+# below), the number of concurrent fetches in flight at once is naturally
+# just "how many genuinely new stories showed up this cycle" instead of
+# "every item in every feed" — safe to raise a bit higher than before for
+# faster turnaround on real news.
+_CONTENT_FETCH_CONCURRENCY = 10
 
 
 class _BroadcastPlugin(BasePlugin):
@@ -32,12 +37,28 @@ class _BroadcastPlugin(BasePlugin):
         self._content_semaphore = asyncio.Semaphore(_CONTENT_FETCH_CONCURRENCY)
 
     async def item_scraped(self, item, spider) -> None:  # noqa: ANN001 - bitscrape's own signature
+        url = item.get("sourceUrl", "")
+
+        # FIX: this used to run the *entire* per-item pipeline below —
+        # live-page fetch, HTML/image extraction, ad re-check, topic
+        # classification — for every item in every feed, every crawl
+        # cycle, then only found out at `publish()` (the very last line)
+        # that ~95%+ of them were the same stories already broadcast last
+        # cycle and got dropped. All that work ran for nothing. Bailing
+        # out here, before any of it, on a plain "have we seen this URL"
+        # check is what actually makes a cycle fast and stops the same
+        # articles being re-fetched over and over: only genuinely new
+        # items ever reach the network call below, so a 120-item feed
+        # with 3 new stories now does 3 fetches, not 120.
+        if not url or await self._broadcaster.already_seen(url):
+            return
+
         # This app doesn't run ads at all yet — if an RSS item is itself a
         # sponsored/promoted placement rather than an editorial story, it
         # never enters the feed. No half-measure (labeling it, etc.) since
         # there's no ad product here for it to belong to.
         if is_advertisement(item):
-            logger.info("Dropped ad/sponsored item: %s", item.get("sourceUrl"))
+            logger.info("Dropped ad/sponsored item: %s", url)
             return
 
         # RSS/Atom only ever gives us an excerpt and, often, no usable
@@ -71,7 +92,7 @@ class _BroadcastPlugin(BasePlugin):
         # interstitial or "sponsored" wrapper page even though the RSS
         # entry itself looked clean — re-check now that content is in.
         if is_advertisement(item):
-            logger.info("Dropped ad/sponsored item after content fetch: %s", item.get("sourceUrl"))
+            logger.info("Dropped ad/sponsored item after content fetch: %s", url)
             return
 
         await self._broadcaster.publish(item)

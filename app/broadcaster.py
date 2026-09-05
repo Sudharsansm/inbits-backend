@@ -69,6 +69,19 @@ class Broadcaster:
         async with self._lock:
             return len(self._clients)
 
+    async def already_seen(self, url: str) -> bool:
+        """Cheap, read-only check for "have we already broadcast this
+        URL". Exists so the crawler (see `_BroadcastPlugin.item_scraped`
+        in crawler.py) can skip the expensive per-item pipeline — full
+        live-page fetch, HTML parsing, image extraction, topic
+        classification — for articles it's already seen in a previous
+        cycle, instead of doing all of that work and only then discovering
+        it was wasted when `publish()`'s dedup drops it at the end. This
+        is what actually makes a crawl cycle fast: a 120-item feed with 3
+        genuinely new stories now does 3 content fetches, not 120."""
+        async with self._lock:
+            return bool(url) and url in self._seen_urls
+
     async def publish(self, item: dict[str, Any]) -> None:
         """Called by the crawler for every item scraped. Dedupes by URL,
         adds it to the rolling window, and immediately pushes it to every

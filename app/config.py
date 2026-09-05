@@ -67,7 +67,11 @@ class Settings:
     # How often (seconds) the whole feed list is re-crawled. Each new item
     # discovered mid-crawl is pushed to clients immediately — this interval
     # is "how long before we look for new items again", not a batch delay.
-    refresh_interval_seconds: int = int(os.getenv("REFRESH_INTERVAL_SECONDS", "120"))
+    # A full cycle now skips already-broadcast items before doing any real
+    # work (see crawler.py's `item_scraped`), so it's cheap even at a
+    # shorter interval — lowered from 120s so genuinely new stories are
+    # found and pushed sooner.
+    refresh_interval_seconds: int = int(os.getenv("REFRESH_INTERVAL_SECONDS", "45"))
 
     # Size of the in-memory rolling window used only to (a) hand new
     # WebSocket connections an initial feed and (b) serve scroll/pagination.
